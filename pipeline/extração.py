@@ -1,9 +1,10 @@
-import firebirdsql
-import pandas as pd
-from sqlalchemy import create_engine, text
-from dotenv import load_dotenv
 import os
 import io
+import firebirdsql
+import pandas as pd
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
+from apscheduler.schedulers.blocking import BlockingScheduler
 from tqdm import tqdm
 import logging
 
@@ -11,7 +12,6 @@ class DatabaseMigration:
     def __init__(self):
         load_dotenv()
 
-        # Configuração do Firebird
         self.firebird_config = {
             'host': os.getenv("FIREBIRD_HOST"),
             'database': os.getenv("FIREBIRD_DATABASE"),
@@ -20,16 +20,13 @@ class DatabaseMigration:
             'charset': 'ISO8859_1'
         }
 
-        # Configuração do PostgreSQL
         self.engine = create_engine(
             f'postgresql+psycopg2://{os.getenv("POSTGRES_USER")}:{os.getenv("POSTGRES_PASSWORD")}@{os.getenv("POSTGRES_HOST")}:{os.getenv("POSTGRES_PORT")}/{os.getenv("POSTGRES_DB")}',
             pool_size=5, max_overflow=10
         )
 
-        # Certificar que o schema bronze existe no PostgreSQL
         self.ensure_bronze_schema()
 
-        # Configuração de logging
         logging.basicConfig(filename='migration.log', level=logging.INFO,
                             format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -40,25 +37,22 @@ class DatabaseMigration:
 
     def create_table_in_postgres(self, table_name, columns):
         column_definitions = ", ".join([f'"{col}" TEXT' for col in columns])
-        create_table_query = f'CREATE TABLE IF NOT EXISTS bronze."{table_name}" ({column_definitions});'
-        
+        query = f'CREATE TABLE IF NOT EXISTS bronze."{table_name}" ({column_definitions});'
         with self.engine.connect() as connection:
-            connection.execute(text(create_table_query))
+            connection.execute(text(query))
             connection.commit()
 
     def list_firebird_tables(self):
         with firebirdsql.connect(**self.firebird_config) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT RDB$RELATION_NAME FROM RDB$RELATIONS WHERE RDB$SYSTEM_FLAG = 0;")
-            tables = [row[0].strip() for row in cursor.fetchall()]
-        return tables
+            return [row[0].strip() for row in cursor.fetchall()]
 
     def sanitize_dataframe(self, df):
-        # Remove caracteres nulos (0x00) em células de texto, mantendo valores NULL inalterados
         return df.apply(lambda col: col.map(lambda x: x.replace('\x00', '') if isinstance(x, str) else x))
 
     def load_data_using_copy(self, df, table_name):
-        df = self.sanitize_dataframe(df)  # Remover caracteres nulos
+        df = self.sanitize_dataframe(df)
         csv_buffer = io.StringIO()
         df.to_csv(csv_buffer, index=False, header=False)
         csv_buffer.seek(0)
@@ -72,7 +66,6 @@ class DatabaseMigration:
         except Exception as e:
             print(f"Erro ao carregar bloco para bronze.{table_name}: {e}")
             conn.rollback()
-            # Se o carregamento em bloco falhar, tenta inserir linha a linha
             self.load_rows_individually(df, table_name)
         finally:
             cursor.close()
@@ -81,7 +74,6 @@ class DatabaseMigration:
     def load_rows_individually(self, df, table_name):
         conn = self.engine.raw_connection()
         cursor = conn.cursor()
-
         for index, row in df.iterrows():
             try:
                 csv_buffer = io.StringIO()
@@ -96,100 +88,65 @@ class DatabaseMigration:
         conn.close()
 
     def get_destination_row_count(self, table_name):
-        """
-        Retorna a quantidade de linhas já carregadas na tabela de destino.
-        Essa contagem é utilizada para definir o offset e evitar recarregar linhas já migradas.
-        """
         with self.engine.connect() as connection:
             result = connection.execute(text(f'SELECT COUNT(*) FROM bronze."{table_name}"'))
             return result.scalar()
 
     def extract_and_load_data_in_chunks(self, table_name, block_size=10000):
-        # Obtém informações da tabela de origem
         with firebirdsql.connect(**self.firebird_config) as conn:
             cursor = conn.cursor()
             cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
             total_records = cursor.fetchone()[0]
 
-            cursor.execute(f"SELECT * FROM {table_name} ROWS 1 TO 1")  # Pega cabeçalhos
+            cursor.execute(f"SELECT * FROM {table_name} ROWS 1 TO 1")
             columns = [desc[0].strip() for desc in cursor.description]
 
-        # Cria a tabela no destino se necessário
         self.create_table_in_postgres(table_name, columns)
-
-        # Obtém quantas linhas já foram carregadas no destino
-        last_processed_row_count = self.get_destination_row_count(table_name)
-        offset = last_processed_row_count
+        offset = self.get_destination_row_count(table_name)
 
         print(f"Iniciando a migração da tabela {table_name}: {total_records} linhas na origem, {offset} já carregadas.")
 
-        with tqdm(total=total_records - offset, desc=f"Carregando dados de {table_name}") as pbar:
+        with tqdm(total=total_records - offset, desc=f"Carregando {table_name}") as pbar:
             while offset < total_records:
                 with firebirdsql.connect(**self.firebird_config) as conn:
                     cursor = conn.cursor()
-                    # Usa a cláusula ROWS para extrair do offset+1 até offset+block_size
-                    paginated_query = f"SELECT * FROM {table_name} ROWS {offset + 1} TO {offset + block_size}"
-                    cursor.execute(paginated_query)
+                    query = f"SELECT * FROM {table_name} ROWS {offset + 1} TO {offset + block_size}"
+                    cursor.execute(query)
                     rows = cursor.fetchall()
 
-                    if not rows:
-                        break
+                if not rows:
+                    break
 
-                    df = pd.DataFrame(rows, columns=columns)
-                    self.load_data_using_copy(df, table_name)
+                df = pd.DataFrame(rows, columns=columns)
+                self.load_data_using_copy(df, table_name)
+                offset += len(rows)
+                pbar.update(len(rows))
 
-                    offset += len(rows)
-                    pbar.update(len(rows))
+    def run_migration(self):
+        tables_to_load = [
+            "FC11000", "FC11100", "FC31110", "FC31100", "FC03000", "FC04200", "FC04300", 
+            "FC0D100", "FC01000", "FC03110",
+            "FC03140", "FC03160", "FC03100", "FC12100", "FC17000", "FC02000", "FC02200", "FC31200",
+            "FC07000", "FC07100", "FC07200", "FC15000", "FC15100", "FC15110", "FC03190",
+            "FC14000", "FC14100", "FC12110", "FC12400", "FC12440", "FC12442", "FC04000",
+            "FC08000", "FC06000", "FC12410","FC0D000", "FC1B100","FC12500"
+        ]
 
-        print(f"Migração da tabela {table_name} finalizada. Total de linhas processadas: {offset}.")
-
-    def run_migration(self, tables_to_load):
         available_tables = self.list_firebird_tables()
-        # Considera somente as tabelas que existem na origem
-        tables_to_load = [table for table in tables_to_load if table in available_tables]
+        valid_tables = [t for t in tables_to_load if t in available_tables]
 
-        print("Tabelas disponíveis no Firebird:", available_tables)
-        print("Tabelas a serem carregadas:", tables_to_load)
-
-        for table in tables_to_load:
-            print(f"Iniciando a migração dos dados da tabela {table} para o PostgreSQL...")
-            self.extract_and_load_data_in_chunks(table)
-            print(f"Tabela {table} migrada com sucesso!")
+        for table in valid_tables:
+            try:
+                print(f"Iniciando migração da tabela {table}")
+                self.extract_and_load_data_in_chunks(table)
+                logging.info(f"Tabela {table} migrada com sucesso.")
+            except Exception as e:
+                logging.error(f"Erro ao migrar a tabela {table}: {e}")
 
 if __name__ == "__main__":
-    migration = DatabaseMigration()
-    # Lista de tabelas a serem migradas
-    tables_to_load = [
-        "FC11000",
-        "FC11100",
-        "FC01000",
-        "FC03110",
-        "FC03000",
-        "FC03140",
-        "FC03160",
-        "FC03100",
-        "FC12100",
-        "FC02000",
-        "FC02200",
-        "FC07000",
-        "FC07100",
-        "FC07200",
-        "FC03100",
-        "FC15000",
-        "FC15100",
-        "FC15110",
-        "FC03140",
-        "FC03110",
-        "FC03160",
-        "FC03190",
-        "FC12100",
-        "FC14000",
-        "FC14100",
-        "FC12110",
-        "FC03J10"
-    ]
-    migration.run_migration(tables_to_load)
-    logging.info("Processo de migração finalizado com sucesso.")
+    print("Executando migração ")
+    migrator = DatabaseMigration()
+    migrator.run_migration()
 
 
 
